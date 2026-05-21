@@ -1,0 +1,1414 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LA Urban Heat & Carbon Risk Explorer</title>
+  <link href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Cormorant+Garamond:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --text: #e6edf3;
+      --muted: #9aa4b2;
+      --red: #d73027;
+      --green: #1a9850;
+      --border: #2a3340;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 16px;
+      padding: 20px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      min-width: 0;
+    }
+    header { padding: 20px 24px; }
+    h1 {
+      margin: 0;
+      font-family: "Cinzel", "Times New Roman", serif;
+      font-size: 1.9rem;
+      letter-spacing: 0.8px;
+    }
+    .subtitle { margin-top: 8px; color: var(--muted); font-size: 1.05rem; }
+    main { display: block; min-height: 620px; }
+    .chart-title {
+      margin: 0 0 10px;
+      color: #d7dee6;
+      font-size: 1.08rem;
+      font-family: "Cinzel", "Times New Roman", serif;
+      letter-spacing: 0.4px;
+    }
+    .map-panel { position: relative; overflow: hidden; min-height: 620px; }
+    #map { width: 100%; height: 100%; min-height: 620px; }
+    .floating-chart {
+      position: absolute;
+      top: 22px;
+      left: 22px;
+      width: min(230px, 24vw);
+      min-height: 160px;
+      padding: 12px 12px 8px;
+      background: rgba(22, 27, 34, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(6px);
+      z-index: 3;
+      cursor: grab;
+      user-select: none;
+      transition: width 220ms ease, min-height 220ms ease, box-shadow 220ms ease;
+    }
+    .floating-chart.enlarged {
+      width: min(520px, 62vw);
+      min-height: 420px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+      cursor: zoom-out;
+    }
+    .floating-chart.dragging { cursor: grabbing; }
+    .chart-wrap { height: 125px; }
+    .floating-chart.enlarged .chart-wrap { height: 320px; }
+    .chart-hint { margin: 0 0 6px; font-size: 0.88rem; color: var(--muted); }
+    .status-badge {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      z-index: 2;
+      font-size: 0.86rem;
+      color: #d7dee6;
+      background: rgba(13, 17, 23, 0.8);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+    .maplibregl-popup-content {
+      background: #161b22;
+      color: #e6edf3;
+      border: 1px solid #2a3340;
+      font-family: "Cormorant Garamond", Georgia, serif;
+      font-size: 0.95rem;
+    }
+    footer {
+      padding: 14px 18px;
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 1rem;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header class="panel">
+    <h1>LA Urban Heat &amp; Carbon Risk Explorer</h1>
+    <div class="subtitle">NDVI x Pollution Burden x Electricity Consumption</div>
+  </header>
+  <main>
+    <section class="panel map-panel">
+      <div class="floating-chart" id="floatingChartCard" title="Click to zoom chart">
+        <h2 class="chart-title">LA County Carbon Emissions (2023)</h2>
+        <p class="chart-hint">Drag to move. Click to enlarge.</p>
+        <div class="chart-wrap"><canvas id="emissionsChart"></canvas></div>
+      </div>
+      <div id="map"></div>
+      <div id="mapStatus" class="status-badge">Loading GeoJSON...</div>
+    </section>
+  </main>
+  <footer class="panel">
+    <div class="legend-item"><span>🟢 Color = NDVI vegetation cover (red=low, green=high)</span></div>
+    <div class="legend-item"><span>📊 Height = CalEnviroScreen pollution burden score</span></div>
+  </footer>
+  <script>
+    const labels = ["Commercial", "Residential", "Industrial", "Transportation", "Agriculture", "Mining"];
+    const values = [2.26, 1.89, 0.91, 0.29, 0.24, 0.12];
+    const pieColors = ["#d73027", "#e75b4d", "#ee7f6f", "#1a9850", "#43ad69", "#6fc185"];
+    const ctx = document.getElementById("emissionsChart");
+    new Chart(ctx, {
+      type: "pie",
+      data: { labels, datasets: [{ label: "MT CO2 (Millions)", data: values, backgroundColor: pieColors, borderColor: "#0d1117", borderWidth: 1.4 }] },
+      options: {
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "bottom", labels: { color: "#e6edf3", font: { family: "Cormorant Garamond" } } },
+          tooltip: { callbacks: { label: (context) => `${context.raw.toFixed(2)}M MT CO2` } }
+        }
+      }
+    });
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+      center: [-118.35, 34.05],
+      zoom: 10.2,
+      pitch: 52,
+      bearing: -12,
+      antialias: true
+    });
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+    const mapStatus = document.getElementById("mapStatus");
+
+    async function loadGeoJson() {
+      const url = "./data/holc_pollution.geojson";
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`GeoJSON request failed: ${response.status}`);
+      }
+      const data = await response.json();
+      if (!data || data.type !== "FeatureCollection") {
+        throw new Error("GeoJSON is not a FeatureCollection.");
+      }
+      mapStatus.textContent = `Loaded data: ${url}`;
+      return data;
+    }
+
+    function getFeatureCollectionBounds(featureCollection) {
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      function extendBounds(coord) {
+        if (!Array.isArray(coord) || coord.length < 2) return;
+        const lng = Number(coord[0]), lat = Number(coord[1]);
+        if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+        minLng = Math.min(minLng, lng); minLat = Math.min(minLat, lat);
+        maxLng = Math.max(maxLng, lng); maxLat = Math.max(maxLat, lat);
+      }
+      function walkCoordinates(coords) {
+        if (!Array.isArray(coords) || coords.length === 0) return;
+        if (typeof coords[0] === "number") return extendBounds(coords);
+        for (const part of coords) walkCoordinates(part);
+      }
+      for (const feature of featureCollection.features || []) {
+        const geometry = feature?.geometry;
+        if (geometry) walkCoordinates(geometry.coordinates);
+      }
+      if (![minLng, minLat, maxLng, maxLat].every(Number.isFinite)) return null;
+      return [[minLng, minLat], [maxLng, maxLat]];
+    }
+
+    map.on("load", async () => {
+      let geojsonData;
+      try {
+        geojsonData = await loadGeoJson();
+      } catch (error) {
+        mapStatus.textContent = `GeoJSON load failed: ${error.message}`;
+        return;
+      }
+      map.addSource("holc-pollution", { type: "geojson", data: geojsonData });
+      map.addLayer({
+        id: "holc-fill",
+        type: "fill",
+        source: "holc-pollution",
+        paint: {
+          "fill-color": [
+            "interpolate", ["linear"],
+            ["coalesce", ["to-number", ["get", "NDVI"]], 0],
+            0, "#d73027",
+            0.15, "#ffffbf",
+            0.3, "#1a9850"
+          ],
+          "fill-opacity": 0.32
+        }
+      });
+      map.addLayer({
+        id: "holc-extrusions",
+        type: "fill-extrusion",
+        source: "holc-pollution",
+        paint: {
+          "fill-extrusion-color": [
+            "interpolate", ["linear"],
+            ["coalesce", ["to-number", ["get", "NDVI"]], 0],
+            0, "#d73027",
+            0.15, "#ffffbf",
+            0.3, "#1a9850"
+          ],
+          "fill-extrusion-height": ["coalesce", ["to-number", ["get", "height"]], 0],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.97
+        }
+      });
+      map.addLayer({
+        id: "holc-extrusions-outline",
+        type: "line",
+        source: "holc-pollution",
+        paint: {
+          "line-color": [
+            "interpolate", ["linear"],
+            ["clamp", ["coalesce", ["to-number", ["get", "NDVI"]], 0], 0, 0.3],
+            0.00, "#ff8080", 0.15, "#fff8a8", 0.30, "#7dffac"
+          ],
+          "line-width": 0.9,
+          "line-opacity": 0.75
+        }
+      });
+      map.setLight({ anchor: "viewport", color: "#ffffff", intensity: 0.78, position: [1.5, 210, 30] });
+      mapStatus.textContent = "GeoJSON loaded. NDVI color + pollution height active.";
+
+      const bounds = getFeatureCollectionBounds(geojsonData);
+      if (bounds) {
+        map.fitBounds(bounds, { padding: { top: 50, bottom: 50, left: 50, right: 50 }, duration: 1200, pitch: 58, bearing: -18 });
+        mapStatus.textContent = `GeoJSON loaded (${geojsonData.features.length} features). Fitted to data bounds.`;
+      }
+    });
+
+    const chartCard = document.getElementById("floatingChartCard");
+    let isDragging = false, dragMoved = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+    chartCard.addEventListener("click", () => { if (dragMoved) return; chartCard.classList.toggle("enlarged"); });
+    chartCard.addEventListener("pointerdown", (event) => {
+      isDragging = true; dragMoved = false;
+      startX = event.clientX; startY = event.clientY;
+      startLeft = chartCard.offsetLeft; startTop = chartCard.offsetTop;
+      chartCard.classList.add("dragging");
+      chartCard.setPointerCapture(event.pointerId);
+    });
+    chartCard.addEventListener("pointermove", (event) => {
+      if (!isDragging) return;
+      const deltaX = event.clientX - startX, deltaY = event.clientY - startY;
+      if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) dragMoved = true;
+      const parent = chartCard.parentElement.getBoundingClientRect();
+      const card = chartCard.getBoundingClientRect();
+      const nextLeft = startLeft + deltaX, nextTop = startTop + deltaY;
+      const minLeft = 6, minTop = 6;
+      const maxLeft = parent.width - card.width - 6, maxTop = parent.height - card.height - 6;
+      chartCard.style.left = `${Math.max(minLeft, Math.min(nextLeft, maxLeft))}px`;
+      chartCard.style.top = `${Math.max(minTop, Math.min(nextTop, maxTop))}px`;
+    });
+    chartCard.addEventListener("pointerup", (event) => {
+      isDragging = false;
+      chartCard.classList.remove("dragging");
+      chartCard.releasePointerCapture(event.pointerId);
+      setTimeout(() => { dragMoved = false; }, 0);
+    });
+  </script>
+</body>
+</html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LA Urban Heat & Carbon Risk Explorer</title>
+  <link href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root { --bg:#0d1117; --panel:#161b22; --text:#e6edf3; --muted:#9aa4b2; --border:#2a3340; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font-family:Arial, sans-serif; background:var(--bg); color:var(--text); display:grid; grid-template-rows:auto 1fr auto; gap:16px; padding:20px; }
+    .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; }
+    header { padding:18px 22px; }
+    h1 { margin:0; font-size:1.6rem; }
+    .subtitle { margin-top:8px; color:var(--muted); }
+    .map-panel { position:relative; min-height:650px; overflow:hidden; }
+    #map { width:100%; height:100%; min-height:650px; }
+    .floating-chart { position:absolute; top:18px; left:18px; width:min(240px,24vw); min-height:150px; padding:10px; background:rgba(22,27,34,.9); border:1px solid var(--border); border-radius:12px; z-index:3; cursor:grab; user-select:none; }
+    .floating-chart.enlarged { width:min(520px,65vw); min-height:410px; }
+    .floating-chart.dragging { cursor:grabbing; }
+    .chart-wrap { height:120px; }
+    .floating-chart.enlarged .chart-wrap { height:320px; }
+    .status-badge { position:absolute; right:12px; bottom:12px; z-index:4; font-size:.86rem; background:rgba(13,17,23,.85); border:1px solid var(--border); border-radius:8px; padding:6px 8px; }
+    footer { padding:12px 16px; color:var(--muted); display:flex; gap:18px; flex-wrap:wrap; }
+  </style>
+</head>
+<body>
+  <header class="panel">
+    <h1>LA Urban Heat &amp; Carbon Risk Explorer</h1>
+    <div class="subtitle">NDVI x Pollution Burden x Electricity Consumption</div>
+  </header>
+  <main>
+    <section class="panel map-panel">
+      <div class="floating-chart" id="floatingChartCard" title="Click to zoom chart">
+        <div style="margin-bottom:6px;">LA County Carbon Emissions (2023)</div>
+        <div class="chart-wrap"><canvas id="emissionsChart"></canvas></div>
+      </div>
+      <div id="map"></div>
+      <div id="mapStatus" class="status-badge">Loading GeoJSON...</div>
+    </section>
+  </main>
+  <footer class="panel">
+    <span>🟢 Color = NDVI vegetation cover (red=low, green=high)</span>
+    <span>📊 Height = CalEnviroScreen pollution burden score</span>
+  </footer>
+
+  <script>
+    new Chart(document.getElementById("emissionsChart"), {
+      type: "pie",
+      data: {
+        labels: ["Commercial","Residential","Industrial","Transportation","Agriculture","Mining"],
+        datasets: [{ data: [2.26,1.89,0.91,0.29,0.24,0.12], backgroundColor: ["#d73027","#e75b4d","#ee7f6f","#1a9850","#43ad69","#6fc185"] }]
+      },
+      options: { maintainAspectRatio: false, plugins: { legend: { position: "bottom", labels: { color: "#e6edf3" } } } }
+    });
+
+    const mapStatus = document.getElementById("mapStatus");
+    const map = new maplibregl.Map({
+      container: "map",
+      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+      center: [-118.35, 34.05],
+      zoom: 10.5,
+      pitch: 58,
+      bearing: -18,
+      antialias: true
+    });
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+    async function loadGeoJson() {
+      const candidates = [
+        "./data/holc_pollution.geojson",
+        "./holc_pollution.geojson",
+        "../data/holc_pollution.geojson"
+      ];
+      for (const url of candidates) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (data?.type === "FeatureCollection") return { data, url };
+        } catch (_) {}
+      }
+      throw new Error("GeoJSON not found");
+    }
+
+    function boundsOf(fc) {
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      const walk = (coords) => {
+        if (!Array.isArray(coords) || coords.length === 0) return;
+        if (typeof coords[0] === "number") {
+          const lng = Number(coords[0]), lat = Number(coords[1]);
+          if (Number.isFinite(lng) && Number.isFinite(lat)) {
+            minLng = Math.min(minLng, lng); minLat = Math.min(minLat, lat);
+            maxLng = Math.max(maxLng, lng); maxLat = Math.max(maxLat, lat);
+          }
+          return;
+        }
+        for (const c of coords) walk(c);
+      };
+      for (const f of fc.features || []) walk(f?.geometry?.coordinates);
+      if (![minLng, minLat, maxLng, maxLat].every(Number.isFinite)) return null;
+      return [[minLng, minLat], [maxLng, maxLat]];
+    }
+
+    map.on("load", async () => {
+      try {
+        const { data, url } = await loadGeoJson();
+        map.addSource("holc", { type: "geojson", data });
+
+        map.addLayer({
+          id: "holc-fill-debug",
+          type: "fill",
+          source: "holc",
+          paint: {
+            "fill-color": [
+              "interpolate", ["linear"],
+              ["clamp", ["coalesce", ["to-number", ["get", "NDVI"]], 0], 0, 0.35],
+              0.00, "#ff2a2a",
+              0.08, "#ff9f1a",
+              0.16, "#ffe66d",
+              0.24, "#7dff9b",
+              0.35, "#00c875"
+            ],
+            "fill-opacity": 0.35
+          }
+        });
+
+        map.addLayer({
+          id: "holc-extrusions",
+          type: "fill-extrusion",
+          source: "holc",
+          paint: {
+            "fill-extrusion-color": [
+              "interpolate", ["linear"],
+              ["clamp", ["coalesce", ["to-number", ["get", "NDVI"]], 0], 0, 0.35],
+              0.00, "#ff2a2a",
+              0.08, "#ff9f1a",
+              0.16, "#ffe66d",
+              0.24, "#7dff9b",
+              0.35, "#00c875"
+            ],
+            "fill-extrusion-height": ["coalesce", ["to-number", ["get", "height"]], 0],
+            "fill-extrusion-base": 0,
+            "fill-extrusion-opacity": 0.95
+          }
+        });
+
+        const vals = (data.features || []).map(f => Number(f?.properties?.NDVI)).filter(Number.isFinite);
+        const min = vals.length ? Math.min(...vals).toFixed(3) : "n/a";
+        const max = vals.length ? Math.max(...vals).toFixed(3) : "n/a";
+        const b = boundsOf(data);
+        if (b) map.fitBounds(b, { padding: 50, duration: 900, pitch: 58, bearing: -18 });
+        mapStatus.textContent = `Loaded ${data.features.length} features from ${url} | NDVI ${min}-${max}`;
+      } catch (e) {
+        mapStatus.textContent = "GeoJSON load failed. Check Live Server root/path.";
+      }
+    });
+
+    const chartCard = document.getElementById("floatingChartCard");
+    let isDragging = false, dragMoved = false, sx = 0, sy = 0, sl = 0, st = 0;
+    chartCard.addEventListener("click", () => { if (!dragMoved) chartCard.classList.toggle("enlarged"); });
+    chartCard.addEventListener("pointerdown", (e) => { isDragging = true; dragMoved = false; sx = e.clientX; sy = e.clientY; sl = chartCard.offsetLeft; st = chartCard.offsetTop; chartCard.classList.add("dragging"); chartCard.setPointerCapture(e.pointerId); });
+    chartCard.addEventListener("pointermove", (e) => {
+      if (!isDragging) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
+      chartCard.style.left = `${sl + dx}px`;
+      chartCard.style.top = `${st + dy}px`;
+    });
+    chartCard.addEventListener("pointerup", (e) => { isDragging = false; chartCard.classList.remove("dragging"); chartCard.releasePointerCapture(e.pointerId); setTimeout(() => { dragMoved = false; }, 0); });
+  </script>
+</body>
+</html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LA Urban Heat & Carbon Risk Explorer</title>
+  <link href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Cormorant+Garamond:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root { --bg:#0d1117; --panel:#161b22; --text:#e6edf3; --muted:#9aa4b2; --border:#2a3340; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font-family:"Cormorant Garamond", Georgia, serif; background:var(--bg); color:var(--text); display:grid; grid-template-rows:auto 1fr auto; gap:16px; padding:20px; }
+    .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; }
+    header { padding:20px 24px; }
+    h1 { margin:0; font-family:"Cinzel", serif; font-size:1.9rem; letter-spacing:0.8px; }
+    .subtitle { margin-top:8px; color:var(--muted); font-size:1.05rem; }
+    .map-panel { position:relative; min-height:620px; overflow:hidden; }
+    #map { width:100%; min-height:620px; height:100%; }
+    .floating-chart { position:absolute; top:22px; left:22px; width:min(230px,24vw); min-height:160px; padding:12px 12px 8px; background:rgba(22,27,34,.88); border:1px solid var(--border); border-radius:12px; box-shadow:0 10px 28px rgba(0,0,0,.35); backdrop-filter:blur(6px); z-index:3; cursor:grab; user-select:none; transition:width .22s ease,min-height .22s ease,box-shadow .22s ease; }
+    .floating-chart.enlarged { width:min(520px,62vw); min-height:420px; box-shadow:0 18px 40px rgba(0,0,0,.5); cursor:zoom-out; }
+    .floating-chart.dragging { cursor:grabbing; }
+    .chart-title { margin:0 0 10px; color:#d7dee6; font-size:1.08rem; font-family:"Cinzel", serif; letter-spacing:0.4px; }
+    .chart-hint { margin:0 0 6px; font-size:.88rem; color:var(--muted); }
+    .chart-wrap { height:125px; }
+    .floating-chart.enlarged .chart-wrap { height:320px; }
+    .status-badge { position:absolute; right:12px; bottom:12px; z-index:2; font-size:.86rem; color:#d7dee6; background:rgba(13,17,23,.8); border:1px solid var(--border); border-radius:8px; padding:6px 8px; }
+    .maplibregl-popup-content { background:#161b22; color:#e6edf3; border:1px solid #2a3340; font-family:"Cormorant Garamond", Georgia, serif; font-size:.95rem; }
+    footer { padding:14px 18px; display:flex; gap:20px; flex-wrap:wrap; font-size:1rem; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <header class="panel">
+    <h1>LA Urban Heat &amp; Carbon Risk Explorer</h1>
+    <div class="subtitle">NDVI x Pollution Burden x Electricity Consumption</div>
+  </header>
+  <main>
+    <section class="panel map-panel">
+      <div class="floating-chart" id="floatingChartCard" title="Click to zoom chart">
+        <h2 class="chart-title">LA County Carbon Emissions (2023)</h2>
+        <p class="chart-hint">Drag to move. Click to enlarge.</p>
+        <div class="chart-wrap"><canvas id="emissionsChart"></canvas></div>
+      </div>
+      <div id="map"></div>
+      <div id="mapStatus" class="status-badge">Loading GeoJSON...</div>
+    </section>
+  </main>
+  <footer class="panel">
+    <span>🟢 Color = NDVI vegetation cover (red=low, green=high)</span>
+    <span>📊 Height = CalEnviroScreen pollution burden score</span>
+  </footer>
+  <script>
+    const labels = ["Commercial", "Residential", "Industrial", "Transportation", "Agriculture", "Mining"];
+    const values = [2.26, 1.89, 0.91, 0.29, 0.24, 0.12];
+    new Chart(document.getElementById("emissionsChart"), {
+      type: "pie",
+      data: { labels, datasets: [{ data: values, backgroundColor: ["#d73027","#e75b4d","#ee7f6f","#1a9850","#43ad69","#6fc185"], borderColor: "#0d1117", borderWidth: 1.4 }] },
+      options: { maintainAspectRatio: false, plugins: { legend: { position: "bottom", labels: { color: "#e6edf3" } } } }
+    });
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+      center: [-118.35, 34.05],
+      zoom: 10.2,
+      pitch: 58,
+      bearing: -18,
+      antialias: true
+    });
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+    const mapStatus = document.getElementById("mapStatus");
+
+    const candidates = ["./holc_pollution.geojson", "./data/holc_pollution.geojson"];
+    async function loadGeoJsonWithFallback() {
+      for (const url of candidates) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) continue;
+          const data = await r.json();
+          if (data && data.type === "FeatureCollection") {
+            mapStatus.textContent = `Loaded data: ${url}`;
+            return data;
+          }
+        } catch (_) {}
+      }
+      throw new Error("GeoJSON not found");
+    }
+
+    function getBounds(fc) {
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      const walk = (coords) => {
+        if (!Array.isArray(coords) || !coords.length) return;
+        if (typeof coords[0] === "number") {
+          const lng = Number(coords[0]), lat = Number(coords[1]);
+          if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+          minLng = Math.min(minLng, lng); minLat = Math.min(minLat, lat);
+          maxLng = Math.max(maxLng, lng); maxLat = Math.max(maxLat, lat);
+          return;
+        }
+        for (const c of coords) walk(c);
+      };
+      for (const f of fc.features || []) walk(f?.geometry?.coordinates);
+      return [minLng, minLat, maxLng, maxLat].every(Number.isFinite) ? [[minLng, minLat], [maxLng, maxLat]] : null;
+    }
+
+    map.on("load", async () => {
+      let geojsonData;
+      try {
+        geojsonData = await loadGeoJsonWithFallback();
+      } catch (_) {
+        mapStatus.textContent = "GeoJSON load failed. Put file in ./data or same folder.";
+        return;
+      }
+      map.addSource("holc-pollution", { type: "geojson", data: geojsonData });
+      map.addLayer({
+        id: "holc-extrusions",
+        type: "fill-extrusion",
+        source: "holc-pollution",
+        paint: {
+          "fill-extrusion-color": [
+            "interpolate", ["linear"],
+            ["clamp", ["coalesce", ["to-number", ["get", "NDVI"]], 0], 0, 0.3],
+            0.00, "#ff2a2a", 0.05, "#ff6a00", 0.10, "#ffb300", 0.15, "#fff36a",
+            0.20, "#b9ff4d", 0.25, "#49df72", 0.30, "#00c875"
+          ],
+          "fill-extrusion-height": ["coalesce", ["to-number", ["get", "height"]], 0],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.97
+        }
+      });
+      map.setLight({ anchor: "viewport", color: "#ffffff", intensity: 0.78, position: [1.5, 210, 30] });
+      const bounds = getBounds(geojsonData);
+      if (bounds) map.fitBounds(bounds, { padding: 50, duration: 1000, pitch: 58, bearing: -18 });
+      mapStatus.textContent = "GeoJSON loaded. 3D + NDVI colors active.";
+    });
+
+    const chartCard = document.getElementById("floatingChartCard");
+    let isDragging = false, dragMoved = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+    chartCard.addEventListener("click", () => { if (!dragMoved) chartCard.classList.toggle("enlarged"); });
+    chartCard.addEventListener("pointerdown", (e) => { isDragging = true; dragMoved = false; startX = e.clientX; startY = e.clientY; startLeft = chartCard.offsetLeft; startTop = chartCard.offsetTop; chartCard.classList.add("dragging"); chartCard.setPointerCapture(e.pointerId); });
+    chartCard.addEventListener("pointermove", (e) => {
+      if (!isDragging) return;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
+      const parent = chartCard.parentElement.getBoundingClientRect();
+      const card = chartCard.getBoundingClientRect();
+      const minLeft = 6, minTop = 6, maxLeft = parent.width - card.width - 6, maxTop = parent.height - card.height - 6;
+      chartCard.style.left = `${Math.max(minLeft, Math.min(startLeft + dx, maxLeft))}px`;
+      chartCard.style.top = `${Math.max(minTop, Math.min(startTop + dy, maxTop))}px`;
+    });
+    chartCard.addEventListener("pointerup", (e) => { isDragging = false; chartCard.classList.remove("dragging"); chartCard.releasePointerCapture(e.pointerId); setTimeout(() => { dragMoved = false; }, 0); });
+  </script>
+</body>
+</html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LA Urban Heat & Carbon Risk Explorer</title>
+  <link href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Cormorant+Garamond:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --text: #e6edf3;
+      --muted: #9aa4b2;
+      --red: #d73027;
+      --green: #1a9850;
+      --border: #2a3340;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 16px;
+      padding: 20px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      min-width: 0;
+    }
+    header { padding: 20px 24px; }
+    h1 {
+      margin: 0;
+      font-family: "Cinzel", "Times New Roman", serif;
+      font-size: 1.9rem;
+      letter-spacing: 0.8px;
+    }
+    .subtitle { margin-top: 8px; color: var(--muted); font-size: 1.05rem; }
+    main { display: block; min-height: 620px; }
+    .chart-title {
+      margin: 0 0 10px;
+      color: #d7dee6;
+      font-size: 1.08rem;
+      font-family: "Cinzel", "Times New Roman", serif;
+      letter-spacing: 0.4px;
+    }
+    .map-panel { position: relative; overflow: hidden; min-height: 620px; }
+    #map { width: 100%; height: 100%; min-height: 620px; }
+    .floating-chart {
+      position: absolute;
+      top: 22px;
+      left: 22px;
+      width: min(230px, 24vw);
+      min-height: 160px;
+      padding: 12px 12px 8px;
+      background: rgba(22, 27, 34, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(6px);
+      z-index: 3;
+      cursor: grab;
+      user-select: none;
+      transition: width 220ms ease, min-height 220ms ease, box-shadow 220ms ease;
+    }
+    .floating-chart.enlarged {
+      width: min(520px, 62vw);
+      min-height: 420px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+      cursor: zoom-out;
+    }
+    .floating-chart.dragging { cursor: grabbing; }
+    .chart-wrap { height: 125px; }
+    .floating-chart.enlarged .chart-wrap { height: 320px; }
+    .chart-hint { margin: 0 0 6px; font-size: 0.88rem; color: var(--muted); }
+    .status-badge {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      z-index: 2;
+      font-size: 0.86rem;
+      color: #d7dee6;
+      background: rgba(13, 17, 23, 0.8);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+    .maplibregl-popup-content {
+      background: #161b22;
+      color: #e6edf3;
+      border: 1px solid #2a3340;
+      font-family: "Cormorant Garamond", Georgia, serif;
+      font-size: 0.95rem;
+    }
+    footer {
+      padding: 14px 18px;
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 1rem;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header class="panel">
+    <h1>LA Urban Heat &amp; Carbon Risk Explorer</h1>
+    <div class="subtitle">NDVI x Pollution Burden x Electricity Consumption</div>
+  </header>
+  <main>
+    <section class="panel map-panel">
+      <div class="floating-chart" id="floatingChartCard" title="Click to zoom chart">
+        <h2 class="chart-title">LA County Carbon Emissions (2023)</h2>
+        <p class="chart-hint">Drag to move. Click to enlarge.</p>
+        <div class="chart-wrap"><canvas id="emissionsChart"></canvas></div>
+      </div>
+      <div id="map"></div>
+      <div id="mapStatus" class="status-badge">Loading GeoJSON...</div>
+    </section>
+  </main>
+  <footer class="panel">
+    <div class="legend-item"><span>🟢 Color = NDVI vegetation cover (red=low, green=high)</span></div>
+    <div class="legend-item"><span>📊 Height = CalEnviroScreen pollution burden score</span></div>
+  </footer>
+  <script>
+    const labels = ["Commercial", "Residential", "Industrial", "Transportation", "Agriculture", "Mining"];
+    const values = [2.26, 1.89, 0.91, 0.29, 0.24, 0.12];
+    const pieColors = ["#d73027", "#e75b4d", "#ee7f6f", "#1a9850", "#43ad69", "#6fc185"];
+    const ctx = document.getElementById("emissionsChart");
+    new Chart(ctx, {
+      type: "pie",
+      data: { labels, datasets: [{ label: "MT CO2 (Millions)", data: values, backgroundColor: pieColors, borderColor: "#0d1117", borderWidth: 1.4 }] },
+      options: {
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "bottom", labels: { color: "#e6edf3", font: { family: "Cormorant Garamond" } } },
+          tooltip: { callbacks: { label: (context) => `${context.raw.toFixed(2)}M MT CO2` } }
+        }
+      }
+    });
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+      center: [-118.35, 34.05],
+      zoom: 10.2,
+      pitch: 52,
+      bearing: -12,
+      antialias: true
+    });
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+    const mapStatus = document.getElementById("mapStatus");
+
+    async function loadGeoJsonWithFallback() {
+      const candidates = [
+        "./holc_pollution.geojson",
+        "./data/holc_pollution.geojson",
+        "./Documents/GitHub/final-project-sea7825-ops/data/holc_pollution.geojson"
+      ];
+      for (const url of candidates) {
+        try {
+          const response = await fetch(url);
+          if (!response.ok) continue;
+          const data = await response.json();
+          if (data && data.type === "FeatureCollection") {
+            mapStatus.textContent = `Loaded data: ${url}`;
+            return data;
+          }
+        } catch (_) {}
+      }
+      throw new Error("GeoJSON not found in expected paths.");
+    }
+
+    function getFeatureCollectionBounds(featureCollection) {
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      function extendBounds(coord) {
+        if (!Array.isArray(coord) || coord.length < 2) return;
+        const lng = Number(coord[0]), lat = Number(coord[1]);
+        if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+        minLng = Math.min(minLng, lng); minLat = Math.min(minLat, lat);
+        maxLng = Math.max(maxLng, lng); maxLat = Math.max(maxLat, lat);
+      }
+      function walkCoordinates(coords) {
+        if (!Array.isArray(coords) || coords.length === 0) return;
+        if (typeof coords[0] === "number") return extendBounds(coords);
+        for (const part of coords) walkCoordinates(part);
+      }
+      for (const feature of featureCollection.features || []) {
+        const geometry = feature?.geometry;
+        if (geometry) walkCoordinates(geometry.coordinates);
+      }
+      if (![minLng, minLat, maxLng, maxLat].every(Number.isFinite)) return null;
+      return [[minLng, minLat], [maxLng, maxLat]];
+    }
+
+    map.on("load", async () => {
+      let geojsonData;
+      try {
+        geojsonData = await loadGeoJsonWithFallback();
+      } catch (error) {
+        mapStatus.textContent = "GeoJSON load failed. Run local server and verify path.";
+        return;
+      }
+      map.addSource("holc-pollution", { type: "geojson", data: geojsonData });
+      map.addLayer({
+        id: "holc-extrusions",
+        type: "fill-extrusion",
+        source: "holc-pollution",
+        paint: {
+          "fill-extrusion-color": [
+            "interpolate", ["linear"],
+            ["clamp", ["coalesce", ["to-number", ["get", "NDVI"]], 0], 0, 0.3],
+            0.00, "#ff2a2a", 0.05, "#ff6a00", 0.10, "#ffb300", 0.15, "#fff36a",
+            0.20, "#b9ff4d", 0.25, "#49df72", 0.30, "#00c875"
+          ],
+          "fill-extrusion-height": ["coalesce", ["to-number", ["get", "height"]], 0],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.97
+        }
+      });
+      map.addLayer({
+        id: "holc-extrusions-outline",
+        type: "line",
+        source: "holc-pollution",
+        paint: {
+          "line-color": [
+            "interpolate", ["linear"],
+            ["clamp", ["coalesce", ["to-number", ["get", "NDVI"]], 0], 0, 0.3],
+            0.00, "#ff8080", 0.15, "#fff8a8", 0.30, "#7dffac"
+          ],
+          "line-width": 0.9,
+          "line-opacity": 0.75
+        }
+      });
+      map.setLight({ anchor: "viewport", color: "#ffffff", intensity: 0.78, position: [1.5, 210, 30] });
+      mapStatus.textContent = "GeoJSON loaded. NDVI color + pollution height active.";
+
+      const bounds = getFeatureCollectionBounds(geojsonData);
+      if (bounds) {
+        map.fitBounds(bounds, { padding: { top: 50, bottom: 50, left: 50, right: 50 }, duration: 1200, pitch: 58, bearing: -18 });
+        mapStatus.textContent = "GeoJSON loaded. Fitted to data bounds.";
+      }
+
+      const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
+      map.on("mousemove", "holc-extrusions", (event) => {
+        map.getCanvas().style.cursor = "pointer";
+        const feature = event.features && event.features[0];
+        if (!feature) return;
+        const properties = feature.properties || {};
+        const grade = properties.grade ?? "N/A";
+        const ndvi = properties.NDVI ?? "N/A";
+        const ciScore = properties.CIscore ?? "N/A";
+        popup.setLngLat(event.lngLat).setHTML(`<strong>Grade:</strong> ${grade}<br><strong>NDVI:</strong> ${ndvi}<br><strong>CIscore:</strong> ${ciScore}`).addTo(map);
+      });
+      map.on("mouseleave", "holc-extrusions", () => {
+        map.getCanvas().style.cursor = "";
+        popup.remove();
+      });
+    });
+
+    const chartCard = document.getElementById("floatingChartCard");
+    let isDragging = false, dragMoved = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+    chartCard.addEventListener("click", () => {
+      if (dragMoved) return;
+      chartCard.classList.toggle("enlarged");
+    });
+    chartCard.addEventListener("pointerdown", (event) => {
+      isDragging = true; dragMoved = false;
+      startX = event.clientX; startY = event.clientY;
+      startLeft = chartCard.offsetLeft; startTop = chartCard.offsetTop;
+      chartCard.classList.add("dragging");
+      chartCard.setPointerCapture(event.pointerId);
+    });
+    chartCard.addEventListener("pointermove", (event) => {
+      if (!isDragging) return;
+      const deltaX = event.clientX - startX, deltaY = event.clientY - startY;
+      if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) dragMoved = true;
+      const parent = chartCard.parentElement.getBoundingClientRect();
+      const card = chartCard.getBoundingClientRect();
+      const nextLeft = startLeft + deltaX, nextTop = startTop + deltaY;
+      const minLeft = 6, minTop = 6;
+      const maxLeft = parent.width - card.width - 6, maxTop = parent.height - card.height - 6;
+      chartCard.style.left = `${Math.max(minLeft, Math.min(nextLeft, maxLeft))}px`;
+      chartCard.style.top = `${Math.max(minTop, Math.min(nextTop, maxTop))}px`;
+    });
+    chartCard.addEventListener("pointerup", (event) => {
+      isDragging = false;
+      chartCard.classList.remove("dragging");
+      chartCard.releasePointerCapture(event.pointerId);
+      setTimeout(() => { dragMoved = false; }, 0);
+    });
+  </script>
+</body>
+</html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LA Urban Heat & Carbon Risk Explorer</title>
+  <link href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Cormorant+Garamond:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --text: #e6edf3;
+      --muted: #9aa4b2;
+      --red: #d73027;
+      --green: #1a9850;
+      --border: #2a3340;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 16px;
+      padding: 20px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    header {
+      padding: 20px 24px;
+    }
+
+    h1 {
+      margin: 0;
+      font-family: "Cinzel", "Times New Roman", serif;
+      font-size: 1.9rem;
+      letter-spacing: 0.8px;
+    }
+
+    .subtitle {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 1.05rem;
+    }
+
+    main {
+      display: block;
+      min-height: 620px;
+    }
+
+    .panel {
+      min-width: 0;
+    }
+
+    .chart-title {
+      margin: 0 0 10px;
+      color: #d7dee6;
+      font-size: 1.08rem;
+      font-family: "Cinzel", "Times New Roman", serif;
+      letter-spacing: 0.4px;
+    }
+
+    .map-panel {
+      position: relative;
+      overflow: hidden;
+      min-height: 620px;
+    }
+
+    #map {
+      width: 100%;
+      height: 100%;
+      min-height: 620px;
+    }
+
+    .floating-chart {
+      position: absolute;
+      top: 22px;
+      left: 22px;
+      width: min(230px, 24vw);
+      min-height: 160px;
+      padding: 12px 12px 8px;
+      background: rgba(22, 27, 34, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(6px);
+      z-index: 3;
+      cursor: grab;
+      user-select: none;
+      transition: width 220ms ease, min-height 220ms ease, box-shadow 220ms ease;
+    }
+
+    .floating-chart.enlarged {
+      width: min(520px, 62vw);
+      min-height: 420px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+      cursor: zoom-out;
+    }
+
+    .floating-chart.dragging {
+      cursor: grabbing;
+    }
+
+    .chart-wrap {
+      height: 125px;
+    }
+
+    .floating-chart.enlarged .chart-wrap {
+      height: 320px;
+    }
+
+    .chart-hint {
+      margin: 0 0 6px;
+      font-size: 0.88rem;
+      color: var(--muted);
+    }
+
+    .status-badge {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      z-index: 2;
+      font-size: 0.86rem;
+      color: #d7dee6;
+      background: rgba(13, 17, 23, 0.8);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+
+    .maplibregl-popup-content {
+      background: #161b22;
+      color: #e6edf3;
+      border: 1px solid #2a3340;
+      font-family: "Cormorant Garamond", Georgia, serif;
+      font-size: 0.95rem;
+    }
+
+    footer {
+      padding: 14px 18px;
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 1rem;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+    }
+
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 2px;
+    }
+
+    .swatch.green {
+      background: var(--green);
+    }
+
+    .swatch.red {
+      background: var(--red);
+    }
+
+    @media (max-width: 960px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="panel">
+    <h1>LA Urban Heat &amp; Carbon Risk Explorer</h1>
+    <div class="subtitle">
+      NDVI x Pollution Burden x Electricity Consumption
+    </div>
+  </header>
+
+  <main>
+    <section class="panel map-panel">
+      <div class="floating-chart" id="floatingChartCard" title="Click to zoom chart">
+        <h2 class="chart-title">LA County Carbon Emissions (2023)</h2>
+        <p class="chart-hint">Drag to move. Click to enlarge.</p>
+        <div class="chart-wrap">
+          <canvas id="emissionsChart"></canvas>
+        </div>
+      </div>
+      <div id="map"></div>
+      <div id="mapStatus" class="status-badge">Loading GeoJSON...</div>
+    </section>
+  </main>
+
+  <footer class="panel">
+    <div class="legend-item">
+      <span>🟢 Color = NDVI vegetation cover (red=low, green=high)</span>
+    </div>
+    <div class="legend-item">
+      <span>📊 Height = CalEnviroScreen pollution burden score</span>
+    </div>
+  </footer>
+
+  <script>
+    const labels = [
+      "Commercial",
+      "Residential",
+      "Industrial",
+      "Transportation",
+      "Agriculture",
+      "Mining"
+    ];
+
+    const values = [2.26, 1.89, 0.91, 0.29, 0.24, 0.12];
+
+    const pieColors = ["#d73027", "#e75b4d", "#ee7f6f", "#1a9850", "#43ad69", "#6fc185"];
+
+    const ctx = document.getElementById("emissionsChart");
+    new Chart(ctx, {
+      type: "pie",
+      data: {
+        labels,
+        datasets: [
+          {
+            label: "MT CO2 (Millions)",
+            data: values,
+            backgroundColor: pieColors,
+            borderColor: "#0d1117",
+            borderWidth: 1.4
+          }
+        ]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: "bottom",
+            labels: {
+              color: "#e6edf3",
+              font: {
+                family: "Cormorant Garamond"
+              }
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: (context) => `${context.raw.toFixed(2)}M MT CO2`
+            }
+          }
+        }
+      }
+    });
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+      center: [-118.35, 34.05],
+      zoom: 10.2,
+      pitch: 52,
+      bearing: -12,
+      antialias: true
+    });
+
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+    const mapStatus = document.getElementById("mapStatus");
+
+    async function loadGeoJsonWithFallback() {
+      const candidates = [
+        "./holc_pollution.geojson",
+        "./data/holc_pollution.geojson",
+        "/Documents/GitHub/final-project-sea7825-ops/data/holc_pollution.geojson"
+      ];
+
+      for (const url of candidates) {
+        try {
+          const response = await fetch(url);
+          if (!response.ok) continue;
+          const data = await response.json();
+          if (data && data.type === "FeatureCollection") {
+            mapStatus.textContent = `Loaded data: ${url}`;
+            return data;
+          }
+        } catch (_) {
+          // Try next candidate path.
+        }
+      }
+      throw new Error("GeoJSON not found in expected paths.");
+    }
+
+    function getFeatureCollectionBounds(featureCollection) {
+      let minLng = Infinity;
+      let minLat = Infinity;
+      let maxLng = -Infinity;
+      let maxLat = -Infinity;
+
+      function extendBounds(coord) {
+        if (!Array.isArray(coord) || coord.length < 2) return;
+        const lng = Number(coord[0]);
+        const lat = Number(coord[1]);
+        if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+        minLng = Math.min(minLng, lng);
+        minLat = Math.min(minLat, lat);
+        maxLng = Math.max(maxLng, lng);
+        maxLat = Math.max(maxLat, lat);
+      }
+
+      function walkCoordinates(coords) {
+        if (!Array.isArray(coords) || coords.length === 0) return;
+        if (typeof coords[0] === "number") {
+          extendBounds(coords);
+          return;
+        }
+        for (const part of coords) {
+          walkCoordinates(part);
+        }
+      }
+
+      for (const feature of featureCollection.features || []) {
+        const geometry = feature?.geometry;
+        if (!geometry) continue;
+        walkCoordinates(geometry.coordinates);
+      }
+
+      if (![minLng, minLat, maxLng, maxLat].every(Number.isFinite)) {
+        return null;
+      }
+      return [[minLng, minLat], [maxLng, maxLat]];
+    }
+
+    map.on("load", async () => {
+      let geojsonData;
+      try {
+        geojsonData = await loadGeoJsonWithFallback();
+      } catch (error) {
+        mapStatus.textContent = "GeoJSON load failed. Run local server and verify path.";
+        return;
+      }
+
+      map.addSource("holc-pollution", {
+        type: "geojson",
+        data: geojsonData
+      });
+
+      map.addLayer({
+        id: "holc-extrusions",
+        type: "fill-extrusion",
+        source: "holc-pollution",
+        paint: {
+          "fill-extrusion-color": [
+            "interpolate",
+            ["linear"],
+            ["coalesce", ["to-number", ["get", "NDVI"]], 0],
+            0, "#d73027",
+            0.15, "#ffffbf",
+            0.3, "#1a9850"
+          ],
+          "fill-extrusion-height": [
+            "coalesce",
+            ["to-number", ["get", "height"]],
+            0
+          ],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.92
+        }
+      });
+      mapStatus.textContent = "GeoJSON loaded. NDVI color + pollution height active.";
+
+      const bounds = getFeatureCollectionBounds(geojsonData);
+      if (bounds) {
+        map.fitBounds(bounds, {
+          padding: { top: 50, bottom: 50, left: 50, right: 50 },
+          duration: 1200
+        });
+        mapStatus.textContent = "GeoJSON loaded. Fitted to data bounds.";
+      }
+
+      const popup = new maplibregl.Popup({
+        closeButton: false,
+        closeOnClick: false
+      });
+
+      map.on("mousemove", "holc-extrusions", (event) => {
+        map.getCanvas().style.cursor = "pointer";
+        const feature = event.features && event.features[0];
+        if (!feature) return;
+
+        const properties = feature.properties || {};
+        const grade = properties.grade ?? "N/A";
+        const ndvi = properties.NDVI ?? "N/A";
+        const ciScore = properties.CIscore ?? "N/A";
+
+        popup
+          .setLngLat(event.lngLat)
+          .setHTML(
+            `<strong>Grade:</strong> ${grade}<br><strong>NDVI:</strong> ${ndvi}<br><strong>CIscore:</strong> ${ciScore}`
+          )
+          .addTo(map);
+      });
+
+      map.on("mouseleave", "holc-extrusions", () => {
+        map.getCanvas().style.cursor = "";
+        popup.remove();
+      });
+    });
+
+    const chartCard = document.getElementById("floatingChartCard");
+    let isDragging = false;
+    let dragMoved = false;
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+
+    chartCard.addEventListener("click", () => {
+      if (dragMoved) return;
+      chartCard.classList.toggle("enlarged");
+    });
+
+    chartCard.addEventListener("pointerdown", (event) => {
+      isDragging = true;
+      dragMoved = false;
+      startX = event.clientX;
+      startY = event.clientY;
+      startLeft = chartCard.offsetLeft;
+      startTop = chartCard.offsetTop;
+      chartCard.classList.add("dragging");
+      chartCard.setPointerCapture(event.pointerId);
+    });
+
+    chartCard.addEventListener("pointermove", (event) => {
+      if (!isDragging) return;
+      const deltaX = event.clientX - startX;
+      const deltaY = event.clientY - startY;
+      if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) dragMoved = true;
+
+      const parent = chartCard.parentElement.getBoundingClientRect();
+      const card = chartCard.getBoundingClientRect();
+      const nextLeft = startLeft + deltaX;
+      const nextTop = startTop + deltaY;
+
+      const minLeft = 6;
+      const minTop = 6;
+      const maxLeft = parent.width - card.width - 6;
+      const maxTop = parent.height - card.height - 6;
+
+      chartCard.style.left = `${Math.max(minLeft, Math.min(nextLeft, maxLeft))}px`;
+      chartCard.style.top = `${Math.max(minTop, Math.min(nextTop, maxTop))}px`;
+    });
+
+    chartCard.addEventListener("pointerup", (event) => {
+      isDragging = false;
+      chartCard.classList.remove("dragging");
+      chartCard.releasePointerCapture(event.pointerId);
+      setTimeout(() => {
+        dragMoved = false;
+      }, 0);
+    });
+  </script>
+</body>
+</html>

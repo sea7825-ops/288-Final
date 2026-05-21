@@ -1,0 +1,252 @@
+# ============================================
+---
+title: "LA Urban Heat & Carbon Risk Explorer"
+subtitle: "Multi-layer Environmental Burden Analysis: NDVI, Pollution, and Electricity"
+author: "Qingrong (Serena) Li"
+date: "May 2026"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+    theme: darkly
+---
+# Setup
+# ============================================
+```{r}
+library(duckdbfs)
+library(dplyr)
+library(rstac)
+library(gdalcubes)
+library(sf)
+library(mapgl)
+library(ellmer)
+library(readxl)
+library(ggplot2)
+gdalcubes_options(parallel = TRUE)
+```
+# ============================================
+# 1. Load HOLC Redlining Data
+# ============================================
+```{r}
+holc_la <- open_dataset(
+  "https://data.source.coop/cboettig/mappinginequality/mappinginequality.parquet"
+) |>
+  filter(city == "Los Angeles") |>
+  to_sf(crs = 4326)
+
+bbox <- st_bbox(holc_la)
+
+holc_clean <- holc_la |>
+  select(area_id, grade, category, geom) |>
+  st_transform("EPSG:4326")
+```
+# ============================================
+# 2. Query Sentinel-2 via STAC
+# ============================================
+```{r}
+items <- stac("https://earth-search.aws.element84.com/v1/") |>
+  stac_search(
+    collections = "sentinel-2-c1-l2a",
+    bbox        = as.numeric(bbox),
+    datetime    = "2023-06-01T00:00:00Z/2023-08-31T23:59:59Z",
+    limit       = 200
+  ) |>
+  ext_query("eo:cloud_cover" < 20) |>
+  post_request() |>
+  items_fetch()
+cat(length(items$features), "scenes found\n")
+```
+# ============================================
+# 3. Compute NDVI
+# ============================================
+```{r}
+col <- stac_image_collection(
+  items$features,
+  asset_names = c("red", "nir", "scl")
+)
+v <- cube_view(
+  srs        = "EPSG:4326",
+  extent     = list(
+    t0 = "2023-06-01", t1 = "2023-08-31",
+    left   = bbox["xmin"], right  = bbox["xmax"],
+    bottom = bbox["ymin"], top    = bbox["ymax"]
+  ),
+  dx = 0.0002, dy = 0.0002,
+  dt = "P3M",
+  aggregation = "median",
+  resampling  = "bilinear"
+)
+S2.mask <- image_mask("scl", values = c(3, 8, 9))
+ndvi <- raster_cube(col, v, mask = S2.mask) |>
+  select_bands(c("red", "nir")) |>
+  apply_pixel("(nir-red)/(nir+red)", "NDVI") |>
+  reduce_time("mean(NDVI)")
+```
+# ============================================
+# 4. Zonal Statistics per HOLC Area
+# ============================================
+```{r}
+zonal <- ndvi |> extract_geom(holc_clean, FUN = mean, reduce_time = TRUE)
+holc_clean$NDVI <- zonal$NDVI
+holc_clean$carbon_score <- 1 - holc_clean$NDVI
+
+holc_clean |>
+  st_drop_geometry() |>
+  group_by(grade) |>
+  summarise(
+    mean_NDVI  = round(mean(NDVI, na.rm = TRUE), 3),
+    mean_score = round(mean(carbon_score, na.rm = TRUE), 3),
+    n = n()
+  )
+```
+# ============================================
+# 5. Electricity & Carbon Emissions
+# ============================================
+```{r}
+elec_raw <- read_excel("data/ca_electricity_county.xlsx")
+
+elec_la <- elec_raw |>
+  filter(COUNTY_NAME == "LOS ANGELES", YEAR == 2023) |>
+  group_by(SECTOR) |>
+  summarise(total_GWh = sum(GWH, na.rm = TRUE)) |>
+  arrange(desc(total_GWh)) |>
+  mutate(
+    total_MWh          = total_GWh * 1000,
+    carbon_emissions_MT = total_MWh * 0.091
+  )
+
+ggplot(elec_la, aes(x = reorder(SECTOR, carbon_emissions_MT),
+                    y = carbon_emissions_MT / 1e6,
+                    fill = SECTOR)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title    = "LA County Carbon Emissions by Sector (2023)",
+    subtitle = "Electricity × CA grid carbon intensity (0.091 MT CO2/MWh)",
+    x = NULL,
+    y = "Carbon Emissions (Million MT CO2)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = scales::comma)
+```
+# ============================================
+# 6. CalEnviroScreen - Pollution Score
+# ============================================
+```{r}
+calenviro_url <- paste0(
+  "https://services1.arcgis.com/PCHfdHz4GlDNAhBb/arcgis/rest/services/",
+  "CalEnviroScreen_4_0_Results_/FeatureServer/0/query?",
+  "where=1%3D1&outFields=tract%2CCIscore%2CCIscoreP%2CTractTXT",
+  "&returnGeometry=true&f=geojson"
+)
+
+calenviro_all <- read_sf(calenviro_url)
+
+calenviro_la <- calenviro_all |>
+  filter(substr(TractTXT, 1, 4) == "6037") |>
+  st_transform(4326)
+```
+# ============================================
+# 7. Spatial Join: HOLC + CalEnviroScreen
+# ============================================
+```{r}
+
+sf_use_s2(FALSE)
+
+calenviro_la_valid <- st_make_valid(calenviro_la)
+holc_clean_valid <- st_make_valid(holc_clean)
+
+holc_with_pollution <- st_join(
+  holc_clean_valid,
+  calenviro_la_valid |> select(CIscore, TractTXT),
+  join = st_intersects
+)
+
+summary(holc_with_pollution$CIscore)
+```
+# ============================================
+# 8. Three-Layer Map
+# Color= NDVI，Height = CIscore
+# ============================================
+```{r}
+holc_with_pollution <- holc_with_pollution |>
+  mutate(
+    CIscore_clean = ifelse(is.na(CIscore), 0, CIscore),
+    # 指数放大：每差1分，高度差2倍效果
+    height = exp(CIscore_clean / 15) * 50
+  )
+
+summary(holc_with_pollution$height)
+
+maplibre(
+  style  = carto_style("dark-matter"),
+  center = c(mean(bbox[c("xmin","xmax")]), mean(bbox[c("ymin","ymax")])),
+  zoom   = 10,
+  pitch  = 60,
+  projection = "mercator"
+) |>
+  add_fill_extrusion_layer(
+    id     = "combined",
+    source = holc_with_pollution,
+    fill_extrusion_color = step_expr(
+      column = "NDVI",
+      base   = "#d73027",
+      values = c(0.1, 0.15, 0.2, 0.25),
+      stops  = c("#fc8d59", "#ffffbf", "#91cf60", "#1a9850")
+    ),
+    fill_extrusion_height = step_expr(
+      column = "height",
+      base   = 10,
+      values = c(100, 300, 600, 1000),
+      stops  = c(100, 300, 600, 1000)
+    ),
+    fill_extrusion_opacity = 0.9,
+    tooltip = "CIscore"  
+  ) |>
+  add_legend(
+    "Color = NDVI | Height = Pollution Burden",
+    values = c("Low NDVI (Red)", "High NDVI (Green)"),
+    colors = c("#d73027", "#1a9850")
+  )
+```
+
+# ============================================
+# 9. AI Analysis
+# ============================================
+```{r}
+Sys.setenv(NRP_API_KEY = "KWEsqVLGHqI3nguEHrWdEay8TVV4CoWz")
+chat <- chat_openai_compatible(
+  base_url    = "https://ellm.nrp-nautilus.io/v1",
+  credentials = function() Sys.getenv("NRP_API_KEY"),
+  model       = "qwen3-small"
+)
+
+summary_stats <- holc_with_pollution |>
+  st_drop_geometry() |>
+  group_by(grade) |>
+  summarise(
+    mean_NDVI    = round(mean(NDVI, na.rm = TRUE), 3),
+    mean_CIscore = round(mean(CIscore, na.rm = TRUE), 1)
+  ) |>
+  as.data.frame()
+
+chat$chat(paste(
+  "In Los Angeles, NDVI and pollution burden (CalEnviroScreen score) by HOLC grade:",
+  paste(capture.output(print(summary_stats)), collapse = " "),
+  "Carbon emissions by sector (2023, million MT CO2):",
+  paste(capture.output(
+    print(elec_la |>
+      select(SECTOR, carbon_emissions_MT) |>
+      mutate(carbon_emissions_MT = round(carbon_emissions_MT / 1e6, 2)))
+  ), collapse = " "),
+  "What does this combined data tell us about environmental justice",
+  "and where should green infrastructure and carbon reduction be prioritized?"
+))
+```
+```{r}
+st_write(holc_with_pollution, 
+         "data/holc_pollution.geojson", 
+         delete_dsn = TRUE)
+```
